@@ -382,6 +382,33 @@ class TestSourceAndSinkCombined:
         assert len(saved_files) == 1
         assert saved_files[0].shape == (1, 2, 128, 128)
 
+    def test_tile_chip_coords_populated(self):
+        """InferenceInput.chip_coords provides full (h_crop, w_crop) read slices for TileSource."""
+        img = _image(h=128, w=128)
+        model = _make_identity_model(out_channels=2)
+        read_windows = []
+
+        class CoordinateCheckSource:
+            def __call__(self, tile: InferenceInput) -> torch.Tensor:
+                assert tile.chip_coords is not None
+                r, c = tile.chip_coords
+                read_windows.append((r.stop - r.start, c.stop - c.start))
+                return tile.input_data
+
+        tiled_inference(
+            model,
+            img,
+            h_crop=64,
+            w_crop=64,
+            h_stride=48,
+            w_stride=48,
+            delta=4,
+            padding="reflect",
+            source=CoordinateCheckSource(),
+        )
+        assert len(read_windows) > 0
+        assert all(shape == (64, 64) for shape in read_windows)
+
     def test_memmap_tile_sink_directly(self):
         """MemmapTileSink satisfies the TileSink protocol and produces correct blended output."""
         sink = MemmapTileSink(input_batch_size=1, h_img=128, w_img=128, delta=4, padding="reflect")

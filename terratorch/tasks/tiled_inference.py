@@ -79,12 +79,14 @@ class TileSource(Protocol):
                 self._ds = rasterio.open(path)
 
             def __call__(self, tile: InferenceInput) -> torch.Tensor:
-                row_off = tile.input_coords[0].start
-                col_off = tile.input_coords[1].start
-                h = tile.input_coords[0].stop - row_off
-                w = tile.input_coords[1].stop - col_off
+                # Use chip_coords (or input_coords) for the read window
+                r_slice, c_slice = tile.chip_coords if tile.chip_coords is not None else tile.input_coords
+                row_off, col_off = r_slice.start, c_slice.start
+                h = r_slice.stop - row_off
+                w = c_slice.stop - col_off
                 window = rasterio.windows.Window(col_off, row_off, w, h)
-                data = self._ds.read(window=window)        # (C, H, W)
+                # boundless=True handles padding/border areas beyond the dataset bounds
+                data = self._ds.read(window=window, boundless=True)  # (C, H, W)
                 return torch.from_numpy(data).float()
     """
 
@@ -281,15 +283,20 @@ class BlendingSink:
             preds = preds[..., d:-d, d:-d]
             preds_count = preds_count[..., d:-d, d:-d]
 
-        if (preds_count == 0).sum() != 0:
+        # Use any() to check for missing classifications without full boolean array materialization
+        if (preds_count == 0).any():
             msg = "Some pixels did not receive a classification!"
             raise RuntimeError(msg)
 
-        output = preds
+        # Normalize in chunks along the height dimension to avoid massive peak RAM spikes
         if self._average_patches:
-            output = output / preds_count.unsqueeze(1)
+            chunk_size = 512
+            h = preds.shape[-2]
+            for r_start in range(0, h, chunk_size):
+                r_end = min(h, r_start + chunk_size)
+                preds[..., r_start:r_end, :] /= preds_count[..., r_start:r_end, :].unsqueeze(1)
 
-        return output.to(self._device)
+        return preds.to(self._device)
 
 
 class InMemoryTileSink(BlendingSink):
@@ -430,6 +437,7 @@ class InferenceInput:
     input_data: torch.Tensor | None
     blend_mask: torch.Tensor
     output_crop: None | tuple[slice, slice]
+    chip_coords: tuple[slice, slice] | None = None
 
 
 def get_input_chips(
@@ -452,6 +460,7 @@ def get_input_chips(
       2. output/input data (optional when using a custom TileSource)
       3. Blend mask for weighting the edges of the chips
       4. Optionally, for inputs, how to crop the output
+      5. Coordinates for reading the chip from the source
     """
     if input_batch is not None:
         input_batch_size = input_batch.shape[0]
@@ -505,6 +514,7 @@ def get_input_chips(
                 patch[b] if patch is not None else None,
                 border_blend_mask,
                 border_output_crop,
+                chip_coords=(slice(i, i + h_crop), slice(w_img - w_crop, w_img)),
             )
             for b in range(input_batch_size)
         ]
@@ -521,6 +531,7 @@ def get_input_chips(
                 patch[b] if patch is not None else None,
                 border_blend_mask,
                 border_output_crop,
+                chip_coords=(slice(h_img - h_crop, h_img), slice(i, i + w_crop)),
             )
             for b in range(input_batch_size)
         ]
@@ -536,6 +547,7 @@ def get_input_chips(
             patch[b] if patch is not None else None,
             border_blend_mask,
             border_output_crop,
+            chip_coords=(slice(h_img - h_crop, h_img), slice(w_img - w_crop, w_img)),
         )
         for b in range(input_batch_size)
     ]
@@ -554,6 +566,7 @@ def get_input_chips(
                         patch[b] if patch is not None else None,
                         border_blend_mask,
                         border_output_crop,
+                        chip_coords=(slice(row, row + h_crop), slice(col, col + w_crop)),
                     )
                     for b in range(input_batch_size)
                 ]
@@ -566,6 +579,7 @@ def get_input_chips(
                         patch[b] if patch is not None else None,
                         inner_blend_mask,
                         inner_output_crop,
+                        chip_coords=(slice(row, row + h_crop), slice(col, col + w_crop)),
                     )
                     for b in range(input_batch_size)
                 ]
@@ -884,12 +898,14 @@ def tiled_inference(
     # Resolve source: default to reading pre-sliced chip from the descriptor.
     effective_source: TileSource = source if source is not None else InMemoryTileSource()
 
-    # Resolve sink: default to the classic in-memory accumulator or disk memmap.
-    effective_sink: TileSink
-    if sink is not None:
-        effective_sink = sink
+    # Resolve accumulator:
+    # If sink is a BlendingSink, it manages its own accumulation and finalization.
+    # Otherwise, use MemmapTileSink (for disk/memmap) or InMemoryTileSink.
+    effective_accumulator: BlendingSink
+    if isinstance(sink, BlendingSink):
+        effective_accumulator = sink
     elif accumulator in ("disk", "memmap"):
-        effective_sink = MemmapTileSink(
+        effective_accumulator = MemmapTileSink(
             input_batch_size=input_batch_size,
             h_img=h_img,
             w_img=w_img,
@@ -899,7 +915,7 @@ def tiled_inference(
             average_patches=average_patches,
         )
     else:
-        effective_sink = InMemoryTileSink(
+        effective_accumulator = InMemoryTileSink(
             input_batch_size=input_batch_size,
             h_img=h_img,
             w_img=w_img,
@@ -908,6 +924,9 @@ def tiled_inference(
             padding=padding,
             average_patches=average_patches,
         )
+
+    # If a raw TileSink (non-BlendingSink) is provided, it receives raw chip writes.
+    custom_raw_sink: TileSink | None = sink if (sink is not None and not isinstance(sink, BlendingSink)) else None
 
     # NOTE: the output may be SLIGHTLY different using batched inputs because of layers such as nn.LayerNorm
     # During inference, these layers compute batch statistics that affect the output.
@@ -926,8 +945,13 @@ def tiled_inference(
             tensor_input = tensor_reshape(tensor_input)  # Optional reshaping for inputs other than plain tensors
             output = model_forward(tensor_input, **kwargs).cpu()
 
-            # Dispatch each chip's prediction to the sink.
+            # Dispatch each chip's prediction to the accumulator (and raw sink if provided).
             for i, chip in enumerate(batch):
-                effective_sink.write(chip, output[i])
+                effective_accumulator.write(chip, output[i])
+                if custom_raw_sink is not None:
+                    custom_raw_sink.write(chip, output[i])
 
-    return effective_sink.finalize()
+    if custom_raw_sink is not None:
+        return custom_raw_sink.finalize()
+
+    return effective_accumulator.finalize()
